@@ -307,12 +307,15 @@ app.post("/api/campaigns/:id/travel", async (c) => {
   }
 });
 
-const TurnBody = z.object({ text: z.string().trim().min(1).max(4000) });
+const TurnBody = z.object({
+  text: z.string().trim().min(1).max(4000),
+  targetIds: z.array(z.string().min(1).max(64)).max(199).optional(),
+});
 
 app.post("/api/campaigns/:id/turns", async (c) => {
   const id = c.req.param("id");
   const parsed = TurnBody.safeParse(await c.req.json().catch(() => null));
-  if (!parsed.success) return c.json({ error: "Message text is required" }, 400);
+  if (!parsed.success) return c.json({ error: "Enter a valid message and select valid NPC targets." }, 400);
   try {
     store.state(id);
   } catch {
@@ -324,6 +327,7 @@ app.post("/api/campaigns/:id/turns", async (c) => {
   return streamSSE(c, async (stream) => {
     try {
       await gm.takeTurn(id, parsed.data.text, {
+        targetIds: parsed.data.targetIds,
         onText: (delta) => void stream.writeSSE({ event: "text", data: JSON.stringify(delta) }),
       });
       await stream.writeSSE({ event: "done", data: JSON.stringify(view(id)) });

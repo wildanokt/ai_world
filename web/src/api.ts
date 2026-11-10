@@ -79,7 +79,7 @@ export interface WorldSummary {
 }
 
 export type TranscriptEntry =
-  | { kind: "player"; text: string }
+  | { kind: "player"; text: string; targets?: { id: string; name: string }[] }
   | { kind: "gm"; text: string }
   | { kind: "npc"; characterId: string; name: string; text: string }
   | {
@@ -186,11 +186,12 @@ export async function takeTurn(
   id: string,
   text: string,
   onText: (delta: string) => void,
+  targetIds: string[] = [],
 ): Promise<Omit<CampaignView, "id">> {
   const res = await fetch(`/api/campaigns/${id}/turns`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text, targetIds }),
   });
   if (!res.ok || !res.body) await json(res);
 

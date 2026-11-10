@@ -129,8 +129,12 @@ const describeRoll = (r: Extract<TranscriptEntry, { kind: "roll" }>) =>
 /** Transcript entries as plain lines, for summarizing. */
 export function transcriptText(entries: TranscriptEntry[]): string {
   return entries
-    .map((e) => (e.kind === "player" ? `Player: ${e.text}` : e.kind === "gm" ? `Game Master: ${e.text}` : e.kind === "npc" ? `${e.name}: ${e.text}` : describeRoll(e)))
+    .map((e) => (e.kind === "player" ? `Player: ${describePlayerLine(e)}` : e.kind === "gm" ? `Game Master: ${e.text}` : e.kind === "npc" ? `${e.name}: ${e.text}` : describeRoll(e)))
     .join("\n\n");
+}
+
+function describePlayerLine(entry: Extract<TranscriptEntry, { kind: "player" }>) {
+  return entry.targets?.length ? `[To ${entry.targets.map(({ name }) => name).join(", ")}] ${entry.text}` : entry.text;
 }
 
 /** Earlier turns as model messages. Rolls are folded into the player turn they belong to. */
@@ -145,7 +149,7 @@ export function historyMessages(transcript: TranscriptEntry[]): ConversationMess
 
       continue;
     }
-    const text = entry.kind === "player" ? entry.text : describeRoll(entry);
+    const text = entry.kind === "player" ? describePlayerLine(entry) : describeRoll(entry);
     if (last?.role === "user") last.text += `\n${text}`;
     else messages.push({ role: "user", text });
   }

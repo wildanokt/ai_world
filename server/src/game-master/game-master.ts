@@ -14,6 +14,7 @@ export interface GameMasterDeps {
 
 export interface TurnOptions {
   onText?: (delta: string) => void;
+  targetIds?: string[];
 }
 
 export interface TurnResult {
@@ -23,6 +24,10 @@ export interface TurnResult {
 const MAX_MODEL_CALLS_PER_TURN = 8;
 const RecallInput = z.object({ query: z.string().trim().min(1).max(300) });
 const STALLED_NARRATION = "The moment stretches on, and the world seems to wait for your next move.";
+
+function normalizedSpeech(text: string) {
+  return text.trim().replace(/\s+/g, " ");
+}
 
 function addressedNpc(state: ReturnType<CampaignStore["state"]>, playerText: string) {
   const speech = playerText.replace(/\*\*[\s\S]+?\*\*/g, " ").trimStart().toLowerCase();
@@ -42,13 +47,27 @@ export function createGameMaster(deps: GameMasterDeps) {
   return {
     async takeTurn(campaignId: string, playerText: string, opts: TurnOptions = {}): Promise<TurnResult> {
       const state = store.state(campaignId);
-      const addressee = addressedNpc(state, playerText);
+      const location = state.characters[state.playerCharacterId]?.location;
+      const targets = [...new Set(opts.targetIds ?? [])].map((id) => {
+        const npc = state.characters[id];
+        if (npc?.role !== "npc" || npc.location !== location || npc.hp <= 0) {
+          throw new ToolRejected("A selected NPC can no longer answer here. Choose targets again.");
+        }
+        return { id: npc.id, name: npc.name };
+      });
+      const addressee = targets.length === 1 ? state.characters[targets[0]!.id] :
+        targets.length === 0 ? addressedNpc(state, playerText) : undefined;
       const directSpeech = !!addressee && !/\*\*[\s\S]+?\*\*/.test(playerText);
       const canAnswer = addressee && addressee.hp > 0 &&
         addressee.location === state.characters[state.playerCharacterId]?.location;
 
       // The whole turn is committed at once, so a failed turn leaves no trace.
-      const turnEvents: AppendableEvent[] = [{ type: "player_said", text: playerText }];
+      const turnEvents: AppendableEvent[] = [{
+        type: "player_said", text: playerText, ...(targets.length ? { targets } : {}),
+      }];
+      const targetIds = new Set(targets.length ? targets.map(({ id }) => id) : addressee ? [addressee.id] : []);
+      const spoken = new Set<string>();
+      const dialogue = new Set<string>();
       let turnState = state;
       let unexpected: unknown = null;
 
@@ -79,8 +98,17 @@ export function createGameMaster(deps: GameMasterDeps) {
         execute(input) {
           try {
             const outcome = runTool(tool.name, input, { state: turnState, d20 });
-            if (addressee && outcome.events.some((event) => event.type === "npc_spoke" && event.characterId !== addressee.id)) {
-              throw new ToolRejected("The player addressed another NPC. Use that NPC if present, otherwise respond as Game Master.");
+            const line = outcome.events.find((event) => event.type === "npc_spoke");
+            if (line) {
+              if (targetIds.size && !targetIds.has(line.characterId)) {
+                throw new ToolRejected("The player addressed other NPCs. Reply as a selected NPC if present, otherwise as Game Master.");
+              }
+              const text = normalizedSpeech(line.text);
+              const key = JSON.stringify([line.characterId, text]);
+              if (spoken.has(key)) return { content: "That line is already delivered. Do not repeat it.", isError: false };
+              spoken.add(key);
+              dialogue.add(text);
+              dialogue.add(normalizedSpeech(line.name + ": " + text));
             }
             const playerJourney = (event: AppendableEvent) =>
               event.type === "journey_completed" && event.characterId === state.playerCharacterId;
@@ -107,18 +135,23 @@ export function createGameMaster(deps: GameMasterDeps) {
       const response = await model.runTurn(
         {
           tier: state.combat || playerText.length > 240 ? "strong" : "fast",
-          system: systemPrompt(state) + (addressee ? (canAnswer
+          system: systemPrompt(state) + (targets.length
+            ? "\nThe player selected these NPC addressees: " + JSON.stringify(targets) +
+              ". Use npc_say for replies by the selected NPCs who have something to say. Never substitute an unselected NPC."
+            : addressee ? (canAnswer
             ? `\nThe player explicitly addresses NPC ${JSON.stringify(addressee.id)}. Send their dialogue via npc_say.`
             : "\nThe player explicitly addresses an unavailable NPC. Respond as Game Master and do not substitute another speaker.") : ""),
           messages: [...historyMessages(recent), currentTurnMessage(playerText, state)],
           tools,
           maxModelCalls: MAX_MODEL_CALLS_PER_TURN,
         },
-        directSpeech && canAnswer ? undefined : opts.onText,
+        (delta) => {
+          if (!(directSpeech && canAnswer) && !dialogue.has(normalizedSpeech(delta))) opts.onText?.(delta);
+        },
       );
       if (unexpected) throw unexpected;
 
-      let narration = response.text;
+      let narration = dialogue.has(normalizedSpeech(response.text)) ? "" : response.text;
       const spoke = turnEvents.some((event) => event.type === "npc_spoke");
       if (!spoke && directSpeech && canAnswer && addressee && narration.trim()) {
         const npc = turnState.characters[addressee.id];

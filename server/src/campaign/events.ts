@@ -102,7 +102,7 @@ export type CampaignEvent =
   | { type: "moved"; characterId: string; to: string }
   | { type: "journey_completed"; characterId: string; from: string; to: string; minutes: number }
   | { type: "npc_journey_progress"; characterId: string; journey: Journey }
-  | { type: "player_said"; text: string }
+  | { type: "player_said"; text: string; targets?: { id: string; name: string }[] }
   | { type: "gm_narrated"; text: string }
   | { type: "npc_spoke"; characterId: string; name: string; text: string }
   | ({ type: "check_rolled" } & RollRecord)
@@ -132,7 +132,7 @@ export interface RollRecord {
 }
 
 export type TranscriptEntry =
-  | { kind: "player"; text: string }
+  | { kind: "player"; text: string; targets?: { id: string; name: string }[] }
   | { kind: "gm"; text: string }
   | { kind: "npc"; characterId: string; name: string; text: string }
   | ({ kind: "roll" } & RollRecord);
@@ -140,7 +140,7 @@ export type TranscriptEntry =
 export function toTranscriptEntry(event: CampaignEvent): TranscriptEntry | null {
   switch (event.type) {
     case "player_said":
-      return { kind: "player", text: event.text };
+      return { kind: "player", text: event.text, ...(event.targets?.length ? { targets: event.targets } : {}) };
     case "gm_narrated":
       return { kind: "gm", text: event.text };
     case "npc_spoke":

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { ApiError, getCampaign, portraitUrl, takeTurn, type CampaignView, type Character, type TranscriptEntry } from "./api";
 import { AiLoading } from "./AiLoading";
 import { GodConsole } from "./GodConsole";
@@ -32,9 +32,10 @@ function loadInitialCampaign() {
 
 export function App() {
   const [campaign, setCampaign] = useState<CampaignView | null>(null);
-  const [pending, setPending] = useState<{ player: string; narration: string } | null>(null);
+  const [pending, setPending] = useState<{ player: string; narration: string; targets: { id: string; name: string }[] } | null>(null);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState("");
+  const [targetIds, setTargetIds] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [atLatest, setAtLatest] = useState(true);
@@ -43,7 +44,11 @@ export function App() {
   const followLog = useRef(true);
   const log = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
+  const draftMirror = useRef<HTMLDivElement>(null);
+  const targetPicker = useRef<HTMLDetailsElement>(null);
+  const sending = useRef(false);
   const sheetDialog = useRef<HTMLDialogElement>(null);
+  const navigationDialog = useRef<HTMLDialogElement>(null);
 
   async function connect() {
     setLoading(true);
@@ -61,8 +66,16 @@ export function App() {
   useEffect(() => {
     if (followLog.current && log.current) log.current.scrollTop = log.current.scrollHeight;
   }, [campaign, pending]);
+  useEffect(() => {
+    const allowed = new Set(availableAddressees(campaign).map(({ id }) => id));
+    setTargetIds((ids) => ids.every((id) => allowed.has(id)) ? ids : ids.filter((id) => allowed.has(id)));
+  }, [campaign]);
+  useEffect(() => {
+    if (draftMirror.current && input.current) draftMirror.current.scrollTop = input.current.scrollTop;
+  }, [draft]);
 
   function acceptCampaign(next: CampaignView) {
+    if (next.id !== campaign?.id) setTargetIds([]);
     saveId(next.id);
     followLog.current = true;
     setAtLatest(true);
@@ -72,16 +85,17 @@ export function App() {
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const text = draft.trim();
-    if (!campaign || !text || pending || loading) return;
+    if (!campaign || !text || sending.current || pending || loading) return;
+    sending.current = true;
     setDraft("");
     setError("");
     followLog.current = true;
     setAtLatest(true);
-    setPending({ player: text, narration: "" });
+    setPending({ player: text, narration: "", targets: selectedTargets });
     try {
       const next = await takeTurn(campaign.id, text, (delta) =>
         setPending((current) => current ? { ...current, narration: current.narration + delta } : current),
-      );
+        selectedTargets.map(({ id }) => id));
       setCampaign({ id: campaign.id, ...next });
     } catch (err) {
       setError(err instanceof Error && err.message !== "Failed to fetch" ? err.message : "Lost connection to the game. Try again when the server is back.");
@@ -97,6 +111,7 @@ export function App() {
       } catch { /* Keep the original action available to retry. */ }
     } finally {
       setPending(null);
+      sending.current = false;
     }
   }
 
@@ -120,16 +135,42 @@ export function App() {
     }
   }
 
-  function talkTo(name: string) {
+  function toggleTarget(id: string) {
+    setTargetIds((current) => current.includes(id) ? current.filter((target) => target !== id) : [...current, id]);
+  }
+
+  function talkTo(id: string) {
+    toggleTarget(id);
     sheetDialog.current?.close();
-    chooseAction(name + ", ");
+    input.current?.focus();
   }
 
   const pc = campaign?.state.characters[campaign.state.playerCharacterId];
+  const availableTargets = availableAddressees(campaign);
+  const selectedTargets = availableTargets.filter(({ id }) => targetIds.includes(id));
+  const transcript = useMemo(() => withoutRepeatedReplies(campaign?.transcript ?? []), [campaign?.transcript]);
+  const showDraftFormatting = draft.includes("**");
   const isBeginning = campaign?.transcript.length === 0 && !pending;
   const blocked = loading || !!pending;
   const suggestions = isBeginning ? STARTER_ACTIONS : campaign?.state.suggestions ?? [];
   const hasCustomDraft = !!draft.trim() && !suggestions.includes(draft);
+
+  function fromNavigation(action: () => void) {
+    navigationDialog.current?.close();
+    action();
+  }
+
+  const navigation = (
+    <nav className="header-actions" aria-label="Game navigation">
+      <a className="nav-item" href="#story" aria-current="page" onClick={() => navigationDialog.current?.close()}><NavIcon name="story" />Story</a>
+      {pc && <button className="nav-item mobile-sheet" onClick={() => fromNavigation(() => sheetDialog.current?.showModal())} aria-haspopup="dialog"><NavIcon name="campaign" />Campaign</button>}
+      {pc && <button className="nav-item" onClick={() => fromNavigation(openJournal)} aria-haspopup="dialog"><NavIcon name="journal" />Journal</button>}
+      {pc && <button className="nav-item" onClick={() => fromNavigation(() => setTravelOpen(true))} disabled={blocked || !!campaign?.state.combat || pc.hp <= 0}
+        title={campaign?.state.combat ? "End combat before travelling" : undefined} aria-haspopup="dialog"><NavIcon name="travel" />Travel</button>}
+      <button className="nav-item" onClick={() => fromNavigation(() => setConsoleOpen(true))} disabled={blocked} aria-haspopup="dialog"><NavIcon name="console" />God Console</button>
+      <button className="nav-item new-campaign" onClick={() => fromNavigation(() => openSetup())} disabled={blocked || !campaign} aria-haspopup="dialog"><NavIcon name="new" />New campaign</button>
+    </nav>
+  );
 
   return (
     <div className="layout">
@@ -138,23 +179,26 @@ export function App() {
           <span className="world-mark" aria-hidden="true">
             <svg viewBox="0 0 28 28" fill="none"><path d="M14 2 25 14 14 26 3 14 14 2Z"/><path d="M14 6v16M6 14h16m-12-4 8 8m0-8-8 8"/></svg>
           </span>
-          <h1>{campaign?.state.world.name ?? "AI RPG Chat"}</h1>
+          <p className="app-name">AI World</p>
         </div>
-        <div className="header-actions">
-          {pc && <button className="ghost mobile-sheet" onClick={() => sheetDialog.current?.showModal()} aria-haspopup="dialog">Campaign</button>}
-          <button className="ghost" onClick={() => setConsoleOpen(true)} disabled={blocked} aria-haspopup="dialog">God Console</button>
-          {pc && <button className="ghost" onClick={openJournal} aria-haspopup="dialog">Journal</button>}
-          {pc && <button className="ghost travel-button" onClick={() => setTravelOpen(true)} disabled={blocked || !!campaign?.state.combat || pc.hp <= 0}
-            title={campaign?.state.combat ? "End combat before travelling" : undefined} aria-haspopup="dialog">Travel</button>}
-          <button className="ghost new-campaign" onClick={() => openSetup()} disabled={blocked || !campaign} aria-haspopup="dialog">New campaign</button>
-        </div>
+        {navigation}
+        <button type="button" className="ghost menu-toggle" onClick={() => navigationDialog.current?.showModal()}
+          aria-haspopup="dialog"><NavIcon name="menu" />Menu</button>
       </header>
 
-      <main className="chat" aria-label="Story">
+      <dialog ref={navigationDialog} className="navigation-drawer" aria-labelledby="navigation-title">
+        <header>
+          <h2 id="navigation-title">AI World</h2>
+          <button type="button" className="ghost" onClick={() => navigationDialog.current?.close()}>Close</button>
+        </header>
+        {navigation}
+      </dialog>
+
+      <main id="story" className="chat" aria-label="Story" tabIndex={-1}>
         <section className="scene-banner" aria-label={pc ? "Current location" : "Campaign setting"}>
           <div className="scene-title">
-            {pc && <p>{campaignTime(campaign!.state.clock)}</p>}
-            <h2>{pc?.location ?? "Your next adventure"}</h2>
+            {campaign && <p>{campaign.state.world.name} · {campaignTime(campaign.state.clock)}</p>}
+            <h1>{pc?.location ?? "Your next adventure"}</h1>
           </div>
         </section>
         <div ref={log} className="log" role="log" aria-label="Story transcript" tabIndex={0} onScroll={(event) => {
@@ -185,9 +229,9 @@ export function App() {
               <button onClick={connect}>Retry connection</button>
             </section>
           )}
-          {campaign?.transcript.map((entry, index) => <Entry key={index} entry={entry} player={pc} npc={entry.kind === "npc" ? campaign.state.characters[entry.characterId] : undefined} />)}
+          {transcript.map((entry, index) => <Entry key={index} entry={entry} player={pc} npc={entry.kind === "npc" ? campaign?.state.characters[entry.characterId] : undefined} />)}
           {pending && <>
-            <Entry entry={{ kind: "player", text: pending.player }} player={pc} />
+            <Entry entry={{ kind: "player", text: pending.player, targets: pending.targets }} player={pc} />
             <Entry
               entry={{ kind: "gm", text: pending.narration || "Considering your action…" }}
               thinking={!pending.narration}
@@ -212,26 +256,57 @@ export function App() {
             </div>
           )}
           <form className="composer" onSubmit={send}>
+            {availableTargets.length > 0 && <div className="target-controls">
+              <details ref={targetPicker} className="target-picker" onKeyDown={(event) => {
+                if (event.key === "Escape" && event.currentTarget.open) {
+                  event.currentTarget.open = false;
+                  event.currentTarget.querySelector("summary")?.focus();
+                }
+              }}>
+                <summary>Talk to{selectedTargets.length ? ` (${selectedTargets.length})` : ""}</summary>
+                <div className="target-options" role="group" aria-label="NPC dialogue targets">
+                  {availableTargets.map(({ id, name, portrait }) => <button key={id} type="button" className="ghost"
+                    aria-pressed={targetIds.includes(id)} disabled={blocked} onClick={() => toggleTarget(id)}>
+                    {portrait && <img className="portrait" src={portraitUrl(portrait)} alt="" />}
+                    {name}
+                  </button>)}
+                </div>
+              </details>
+              {selectedTargets.length > 0 && <>
+                <span className="target-label" aria-live="polite">To {selectedTargets.map(({ name }) => name).join(", ")}</span>
+                <button type="button" className="ghost clear-targets" disabled={blocked} onClick={() => setTargetIds([])}>Clear</button>
+              </>}
+            </div>}
             <label className="control-label" htmlFor="player-action">Your action or dialogue</label>
             <div className="composer-row">
-              <textarea
-                id="player-action"
-                ref={input}
-                value={draft}
-                onChange={(event) => setDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                    event.preventDefault();
-                    if (!blocked) event.currentTarget.form?.requestSubmit();
-                  }
-                }}
-                placeholder="What do you do or say?"
-                aria-describedby="chat-format-hint"
-                rows={2}
-                maxLength={4000}
-                disabled={!campaign}
-                readOnly={blocked}
-              />
+              <div className="action-field">
+                {showDraftFormatting && <div ref={draftMirror} className="action-mirror" aria-hidden="true">
+                  {formatDraft(draft)}{"\u200b"}
+                </div>}
+                <textarea
+                  id="player-action"
+                  ref={input}
+                  className={showDraftFormatting ? "with-draft-formatting" : undefined}
+                  value={draft}
+                  onChange={(event) => setDraft(event.target.value)}
+                  onFocus={() => { if (targetPicker.current) targetPicker.current.open = false; }}
+                  onScroll={(event) => {
+                    if (draftMirror.current) draftMirror.current.scrollTop = event.currentTarget.scrollTop;
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      if (!blocked) event.currentTarget.form?.requestSubmit();
+                    }
+                  }}
+                  placeholder="What do you do or say?"
+                  aria-describedby="chat-format-hint"
+                  rows={2}
+                  maxLength={4000}
+                  disabled={!campaign}
+                  readOnly={blocked}
+                />
+              </div>
               <button type="submit" disabled={!campaign || blocked || !draft.trim()}>
                 {pending ? "Waiting…" : "Act"}
                 {!pending && <svg viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M4 10h11m-5-5 5 5-5 5" /></svg>}
@@ -244,13 +319,13 @@ export function App() {
       </main>
 
       {campaign && pc && <>
-        <aside className="sheet desktop-sheet" aria-label="Campaign details"><CampaignSheet campaign={campaign} onTalk={blocked || !!draft.trim() ? undefined : talkTo} /></aside>
+        <aside className="sheet desktop-sheet" aria-label="Campaign details"><CampaignSheet campaign={campaign} targetIds={targetIds} onTalk={blocked ? undefined : talkTo} /></aside>
         <dialog ref={sheetDialog} className="sheet-dialog" aria-label="Campaign details">
           <header>
             <h2>Campaign details</h2>
             <button className="ghost" onClick={() => sheetDialog.current?.close()}>Close</button>
           </header>
-          <div className="sheet"><CampaignSheet campaign={campaign} onTalk={blocked || !!draft.trim() ? undefined : talkTo} /></div>
+          <div className="sheet"><CampaignSheet campaign={campaign} targetIds={targetIds} onTalk={blocked ? undefined : talkTo} /></div>
           <footer><button className="ghost" disabled={blocked} onClick={() => {
             sheetDialog.current?.close();
             openSetup();
@@ -279,7 +354,21 @@ export function App() {
   );
 }
 
-function CampaignSheet({ campaign, onTalk }: { campaign: CampaignView; onTalk?: (name: string) => void }) {
+const navigationPaths = {
+  story: "M4 5h16v11H9l-5 4V5Zm4 4h8m-8 3h6",
+  campaign: "M5 4h14v16H5V4Zm4 11a3 3 0 0 1 6 0m-3-4a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z",
+  journal: "M5 4h12a2 2 0 0 1 2 2v14H7a2 2 0 0 1-2-2V4Zm0 13h14M9 8h6m-6 4h6",
+  travel: "m12 3 8 9-8 9-8-9 8-9Zm0 5 2.5 4-2.5 4-2.5-4L12 8Z",
+  console: "M4 7h16M4 17h16M8 4v6m8 4v6",
+  new: "M12 5v14M5 12h14",
+  menu: "M4 6h16M4 12h16M4 18h16",
+};
+
+function NavIcon({ name }: { name: keyof typeof navigationPaths }) {
+  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d={navigationPaths[name]} /></svg>;
+}
+
+function CampaignSheet({ campaign, targetIds, onTalk }: { campaign: CampaignView; targetIds: string[]; onTalk?: (id: string) => void }) {
   const { state } = campaign;
   const pc = state.characters[state.playerCharacterId]!;
   const npcs = Object.values(state.characters).filter((c) => c.role === "npc");
@@ -312,7 +401,8 @@ function CampaignSheet({ campaign, onTalk }: { campaign: CampaignView; onTalk?: 
           {npc.portrait && <img className="portrait" src={portraitUrl(npc.portrait)} alt="" />}
           <span className="npc-name">{npc.name}</span><span className={`attitude ${stance}`}>{stance}</span>
           {npc.hp > 0 && <button type="button" className="ghost talk-button" disabled={!onTalk}
-            aria-label={`Talk to ${npc.name}`} onClick={() => onTalk?.(npc.name)}>Talk</button>}
+            aria-pressed={targetIds.includes(npc.id)} aria-label={`Talk to ${npc.name}`}
+            onClick={() => onTalk?.(npc.id)}>Talk</button>}
         </li>;
       })}</ul> : <p className="muted">{npcs.length ? "No NPCs at this location." : "This Campaign has no NPCs."}</p>}
       {npcs.length > present.length && <p className="muted">NPCs elsewhere: {npcs.length - present.length}</p>}
@@ -353,6 +443,34 @@ function attitude(score = 0) {
   return "devoted";
 }
 
+function availableAddressees(campaign: CampaignView | null) {
+  if (!campaign) return [];
+  const { characters, playerCharacterId } = campaign.state;
+  const location = characters[playerCharacterId]?.location;
+  return Object.values(characters).filter((npc) => npc.role === "npc" && npc.location === location && npc.hp > 0);
+}
+
+function withoutRepeatedReplies(transcript: TranscriptEntry[]) {
+  const seen = new Set<string>();
+  return transcript.filter((entry) => {
+    if (entry.kind === "player") seen.clear();
+    if (entry.kind !== "npc") return true;
+    const key = JSON.stringify([entry.characterId, entry.text.trim().replace(/\s+/g, " ")]);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function formatDraft(text: string) {
+  return text.split("**").map((part, index) => (
+    <span key={index}>
+      {index > 0 && <span className="action-marker">**</span>}
+      {index % 2 ? <em>{part}</em> : part}
+    </span>
+  ));
+}
+
 function formatActions(text: string) {
   return text.split(/\*\*([\s\S]+?)\*\*/g).map((part, index) =>
     index % 2 === 1 ? <em key={index}>{part}</em> : part,
@@ -377,6 +495,8 @@ function Entry({ entry, player, npc, thinking }: {
       </span>
       <div className="entry-bubble">
         <span className="entry-author">{name}</span>
+        {entry.kind === "player" && !!entry.targets?.length &&
+          <span className="entry-targets">To {entry.targets.map(({ name }) => name).join(", ")}</span>}
         <p>{thinking ? <AiLoading>{entry.text}</AiLoading> : formatActions(entry.text)}</p>
       </div>
     </article>;
