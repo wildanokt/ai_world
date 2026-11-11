@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { CampaignStore } from "../campaign/store.js";
+import type { RuntimeCampaignStore } from "../postgres.js";
 import { applyEvent, type AppendableEvent } from "../campaign/events.js";
 import type { D20 } from "../rules/checks.js";
 import type { ModelProvider, TurnTool } from "../model/provider.js";
@@ -7,7 +8,7 @@ import { GAME_TOOLS, runTool, ToolRejected } from "./tools.js";
 import { currentTurnMessage, historyMessages, systemPrompt } from "./context.js";
 
 export interface GameMasterDeps {
-  store: CampaignStore;
+  store: RuntimeCampaignStore;
   model: ModelProvider;
   d20: D20;
 }
@@ -46,7 +47,7 @@ export function createGameMaster(deps: GameMasterDeps) {
 
   return {
     async takeTurn(campaignId: string, playerText: string, opts: TurnOptions = {}): Promise<TurnResult> {
-      const state = store.state(campaignId);
+      const state = await store.state(campaignId);
       const location = state.characters[state.playerCharacterId]?.location;
       const targets = [...new Set(opts.targetIds ?? [])].map((id) => {
         const npc = state.characters[id];
@@ -131,7 +132,7 @@ export function createGameMaster(deps: GameMasterDeps) {
       tools.push(recall);
 
       // Everything already summarized is replaced by its summary in the system prompt.
-      const recent = store.transcript(campaignId).slice(state.summaries.scenes.at(-1)?.to ?? 0);
+      const recent = (await store.transcript(campaignId)).slice(state.summaries.scenes.at(-1)?.to ?? 0);
       const response = await model.runTurn(
         {
           tier: state.combat || playerText.length > 240 ? "strong" : "fast",
@@ -170,7 +171,7 @@ export function createGameMaster(deps: GameMasterDeps) {
       if (state.suggestions.length && !turnEvents.some((event) => event.type === "replies_suggested")) {
         turnEvents.push({ type: "replies_suggested", replies: [] });
       }
-      store.append(campaignId, turnEvents);
+      await store.append(campaignId, turnEvents);
       return { narration };
     },
   };

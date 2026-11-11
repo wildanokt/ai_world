@@ -19,6 +19,16 @@ The server and Vite development UI bind to loopback. SQLite, images and saved re
 
 See the [player guide](docs/PLAY.md) for Campaign setup, travel, and gameplay.
 
+## PostgreSQL and hosted login
+
+Set `DATABASE_URL` or use `PGHOST`, `PGUSER`, and `PGDATABASE` to run the app on PostgreSQL. The app creates its tables on startup. For a migration, stop SQLite writes and set `RPG_IMPORT_SQLITE` to the old `game.db` on the first PostgreSQL run. The import only populates an empty game database and preserves World, Campaign, and timeline IDs. Copy the existing portraits directory separately if you move hosts.
+
+Set `RPG_PUBLIC_ORIGIN` to your HTTPS app URL to require app login. Serve `web/dist` and proxy `/api` on the same hostname, passing the original Origin header and the backend's loopback Host. With the PostgreSQL environment set, run `node --import tsx server/src/auth/set-password.ts EMAIL` from the repo root and supply the password on stdin. Running it again resets the password and revokes previous sessions.
+
+On the hosted app, open **God Console → Live Campaign → AI settings → Codex login**. **Sign in with ChatGPT** opens normal Codex sign-in in your browser. Copy the full `127.0.0.1` address from the last tab, paste it back into the same AI World session, and select **Finish sign-in**. **Use device code** is also available if enabled in your ChatGPT settings. The Codex CLI running on the host saves the session for the API's OS user.
+
 ## Verify
 
 Run `npm test`, `npm run typecheck`, and `npm run build --workspace web`. Unit tests use scripted responses and local SQLite. The [original handoff](docs/HANDOFF.md) records the pre-port version.
+
+Set `RPG_TEST_POSTGRES=1` with PostgreSQL connection variables and a test database role that can create schemas to run the PostgreSQL integration test.

@@ -19,7 +19,7 @@ const CANDIDATES = 20;
 const RRF_K = 60;
 
 /** The searchable text of an event, or null if it is not worth recalling. */
-function searchableText(event: CampaignEvent, names: Record<string, string>): string | null {
+export function searchableText(event: CampaignEvent, names: Record<string, string>): string | null {
   switch (event.type) {
     case "player_said":
     case "gm_narrated":
@@ -33,6 +33,14 @@ function searchableText(event: CampaignEvent, names: Record<string, string>): st
     default:
       return null;
   }
+}
+
+export function rankRecall(rankings: number[][], limit: number): number[] {
+  const scores = new Map<number, number>();
+  for (const ranking of rankings) {
+    ranking.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (RRF_K + rank + 1)));
+  }
+  return [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id]) => id);
 }
 
 export function createSearchIndex(db: DatabaseSync, embedder?: Embedder) {
@@ -106,11 +114,7 @@ export function createSearchIndex(db: DatabaseSync, embedder?: Embedder) {
         }
       }
 
-      const scores = new Map<number, number>();
-      for (const ranking of rankings) {
-        ranking.forEach((id, rank) => scores.set(id, (scores.get(id) ?? 0) + 1 / (RRF_K + rank + 1)));
-      }
-      const top = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, limit).map(([id]) => id);
+      const top = rankRecall(rankings, limit);
       if (top.length === 0) return [];
       const docs = new Map(
         selectDocs.all(JSON.stringify(top)).map((r) => [Number(r.id), { seq: Number(r.seq), kind: String(r.kind), text: String(r.text) }]),

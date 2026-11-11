@@ -11,6 +11,8 @@ import { Hono, type Context } from "hono";
 import { streamSSE } from "hono/streaming";
 import { z } from "zod";
 import { openCampaignStore } from "./campaign/store.js";
+import { createLogin } from "./auth/login.js";
+import { importSqlite, openPostgres } from "./postgres.js";
 import { createGameMaster } from "./game-master/game-master.js";
 import { codexCli, createCodexProvider, MODEL } from "./model/codex.js";
 import { createCodexAuth, runCodexAuth } from "./model/codex-auth.js";
@@ -29,9 +31,14 @@ const embedder = process.env.OPENAI_API_KEY
   ? createOpenAIEmbedder({ apiKey: process.env.OPENAI_API_KEY, model: process.env.EMBEDDING_MODEL })
   : undefined;
 console.log(`Recall: ${embedder ? `keywords + semantic (${embedder.model})` : "keywords only (set OPENAI_API_KEY for semantic)"}`);
-const store = openCampaignStore(join(DATA_DIR, "game.db"), { embedder });
-const worlds = openWorldStore(join(DATA_DIR, "game.db"));
-if (worlds.list().length === 0) worlds.create(DEFAULT_WORLD);
+const publicOrigin = process.env.RPG_PUBLIC_ORIGIN;
+const postgres = process.env.DATABASE_URL || process.env.PGHOST
+  ? await openPostgres(process.env.DATABASE_URL, embedder) : undefined;
+if (publicOrigin && !postgres) throw new Error("RPG_PUBLIC_ORIGIN requires PostgreSQL for app login.");
+if (postgres && process.env.RPG_IMPORT_SQLITE) await importSqlite(postgres.pool, process.env.RPG_IMPORT_SQLITE);
+const store = postgres?.store ?? openCampaignStore(join(DATA_DIR, "game.db"), { embedder });
+const worlds = postgres?.worlds ?? openWorldStore(join(DATA_DIR, "game.db"));
+if ((await worlds.list()).length === 0) await worlds.create(DEFAULT_WORLD);
 
 const Effort = z.enum(["none", "low", "medium", "high"]);
 const Settings = z.object({ fast: Effort, strong: Effort });
@@ -43,7 +50,7 @@ let settings = Settings.parse({
 try { settings = Settings.parse(JSON.parse(readFileSync(settingsPath, "utf8"))); }
 catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
 const codexBin = process.env.CODEX_BIN ?? (process.platform === "win32" ? "codex.exe" : "codex");
-const codexAuth = createCodexAuth((command) => runCodexAuth(codexBin, command));
+const codexAuth = createCodexAuth((command, device) => runCodexAuth(codexBin, command, device), !!publicOrigin);
 const model = createCodexProvider({
   invoke: codexCli(codexBin),
   effort: (tier) => settings[tier],
@@ -68,12 +75,17 @@ app.use("/api/*", async (c, next) => {
   const host = c.req.header("host");
   const origin = c.req.header("origin");
   const validHosts = [`127.0.0.1:${port}`, `localhost:${port}`];
-  if (!host || !validHosts.includes(host) ||
-      (origin && ![...validHosts, "127.0.0.1:5173", "localhost:5173"].some((allowed) => origin === `http://${allowed}`))) {
-    return c.json({ error: "Local access only." }, 403);
+  const localOrigins = [...validHosts, "127.0.0.1:5173", "localhost:5173"].map((allowed) => `http://${allowed}`);
+  if (!host || !validHosts.includes(host)) return c.json({ error: "Invalid request host." }, 403);
+  const originAllowed = publicOrigin ? origin === publicOrigin : !origin || localOrigins.includes(origin);
+  if (!originAllowed && (origin || !["GET", "HEAD"].includes(c.req.method))) {
+    return c.json({ error: "Invalid request origin." }, 403);
   }
   await next();
 });
+const login = createLogin(publicOrigin ? postgres?.pool : undefined);
+app.route("/api/auth", login.routes);
+app.use("/api/*", login.requireLogin);
 
 /** Known domain errors become clean HTTP errors; anything else is a 500. */
 app.onError((err, c) => {
@@ -93,13 +105,13 @@ async function body<S extends z.ZodType>(c: Context, schema: S): Promise<z.outpu
 
 // --- Worlds (God Console) ---------------------------------------------------------------
 
-app.get("/api/worlds", (c) => c.json(worlds.list()));
-app.get("/api/worlds/:id", (c) => c.json(worlds.get(c.req.param("id"))));
-app.post("/api/worlds", async (c) => c.json(worlds.create(await c.req.json().catch(() => null)), 201));
-app.put("/api/worlds/:id", async (c) => c.json(worlds.update(c.req.param("id"), await c.req.json().catch(() => null))));
-app.delete("/api/worlds/:id", (c) => {
-  if (worlds.list().length <= 1) throw new BadRequest("The last World cannot be deleted.");
-  worlds.remove(c.req.param("id"));
+app.get("/api/worlds", async (c) => c.json(await worlds.list()));
+app.get("/api/worlds/:id", async (c) => c.json(await worlds.get(c.req.param("id"))));
+app.post("/api/worlds", async (c) => c.json(await worlds.create(await c.req.json().catch(() => null)), 201));
+app.put("/api/worlds/:id", async (c) => c.json(await worlds.update(c.req.param("id"), await c.req.json().catch(() => null))));
+app.delete("/api/worlds/:id", async (c) => {
+  if ((await worlds.list()).length <= 1) throw new BadRequest("The last World cannot be deleted.");
+  await worlds.remove(c.req.param("id"));
   return c.body(null, 204);
 });
 
@@ -131,10 +143,10 @@ app.post("/api/drafts/character", async (c) => {
 
 // --- Campaigns --------------------------------------------------------------------------
 
-const view = (id: string) => {
-  const state = store.state(id);
+const view = async (id: string) => {
+  const state = await store.state(id);
   return {
-    id, transcript: store.transcript(id),
+    id, transcript: await store.transcript(id),
     state: {
       ...state,
       world: { id: state.world.id, name: state.world.name },
@@ -170,13 +182,27 @@ app.post("/api/portraits/generate", async (c) => {
 
 app.get("/api/ai/codex-auth", async (c) => {
   c.header("Cache-Control", "no-store");
-  return c.json(await codexAuth.status());
+  return c.json(await codexAuth.status(login.sessionKey(c)));
 });
-app.post("/api/ai/codex-auth", (c) => {
+app.post("/api/ai/codex-auth", async (c) => {
   if (!c.req.header("origin") || c.req.header("content-type") !== "application/json") {
-    return c.json({ error: "Open the local game to start Codex login." }, 403);
+    return c.json({ error: "Start Codex sign-in from AI World." }, 403);
   }
-  if (!codexAuth.start()) return c.json({ error: "Codex login is already in progress." }, 409);
+  const { method } = await body(c, z.object({ method: z.enum(["browser", "device"]).optional() }));
+  if (!codexAuth.start(login.sessionKey(c), method)) return c.json({ error: "Codex login is already in progress." }, 409);
+  return c.json({ login: "pending" }, 202);
+});
+app.post("/api/ai/codex-auth/callback", bodyLimit({ maxSize: 8192 }), async (c) => {
+  c.header("Cache-Control", "no-store");
+  const { address } = await body(c, z.object({ address: z.string().min(1).max(8000) }));
+  const result = await codexAuth.completeBrowser(login.sessionKey(c), address);
+  if (result === "inactive") return c.json({ error: "Start a new browser sign-in in this tab." }, 409);
+  if (result === "invalid") return c.json({ error: "Paste the full address from the last tab for this sign-in." }, 400);
+  if (result === "failed") return c.json({ error: "Codex could not accept this sign-in. Check its status or start again." }, 502);
+  return c.json({ login: "pending" }, 202);
+});
+app.delete("/api/ai/codex-auth", (c) => {
+  if (!codexAuth.cancel(login.sessionKey(c))) return c.json({ error: "No sign-in is pending in this browser." }, 409);
   return c.json({ login: "pending" }, 202);
 });
 
@@ -189,23 +215,27 @@ app.put("/api/ai/settings", async (c) => {
   return c.json({ model: MODEL, ...settings });
 });
 
-app.get("/api/campaigns/:id/timeline", (c) => c.json(store.timeline(c.req.param("id"))));
-app.get("/api/campaigns/:id/inspector", (c) => c.json(store.inspect(c.req.param("id"))));
+app.get("/api/campaigns/:id/timeline", async (c) => c.json(await store.timeline(c.req.param("id"))));
+app.get("/api/campaigns/:id/inspector", async (c) => c.json(await store.inspect(c.req.param("id"))));
 app.post("/api/campaigns/:id/snapshots", async (c) => {
   const id = c.req.param("id");
   const { name } = await body(c, z.object({ name: z.string().trim().min(1).max(80) }));
   if (turnsInProgress.has(id)) return c.json({ error: "A turn is in progress." }, 409);
-  store.state(id);
-  return c.json(store.snapshot(id, name), 201);
+  turnsInProgress.add(id);
+  try { return c.json(await store.snapshot(id, name), 201); }
+  finally { turnsInProgress.delete(id); }
 });
 app.post("/api/campaigns/:id/rewind", async (c) => {
   const id = c.req.param("id");
   const { snapshotId } = await body(c, z.object({ snapshotId: z.string() }));
   if (turnsInProgress.has(id)) return c.json({ error: "A turn is in progress." }, 409);
-  const next = store.rewind(id, snapshotId);
-  if (!next) return c.json({ error: "Snapshot not found." }, 404);
-  afterTurn.startup();
-  return c.json(view(next), 201);
+  turnsInProgress.add(id);
+  try {
+    const next = await store.rewind(id, snapshotId);
+    if (!next) return c.json({ error: "Snapshot not found." }, 404);
+    afterTurn.startup();
+    return c.json(await view(next), 201);
+  } finally { turnsInProgress.delete(id); }
 });
 
 const LiveEdit = z.object({
@@ -226,19 +256,19 @@ app.patch("/api/campaigns/:id/characters/:characterId", async (c) => {
   const { silent, effect, portrait, bringToPlayer, name, profile, hp, maxHp, skills } = await body(c, LiveEdit);
   if (hp !== undefined && hp > maxHp) throw new BadRequest("HP cannot exceed maximum HP.");
   if (turnsInProgress.has(id)) return c.json({ error: "A turn is in progress." }, 409);
-  const state = store.state(id);
-  const character = Object.hasOwn(state.characters, characterId) ? state.characters[characterId] : undefined;
-  if (!character) return c.json({ error: "Character not found." }, 404);
-  if (bringToPlayer && (character.role !== "npc" || state.combat)) {
-    throw new BadRequest("Only NPCs can be brought to the player, outside combat.");
-  }
-  const stats = {
-    hp: hp ?? Math.min(character.hp, maxHp), maxHp, skills,
-    ...(name === undefined ? {} : { name }),
-    ...(profile === undefined ? {} : { profile }),
-  };
   turnsInProgress.add(id);
   try {
+    const state = await store.state(id);
+    const character = Object.hasOwn(state.characters, characterId) ? state.characters[characterId] : undefined;
+    if (!character) return c.json({ error: "Character not found." }, 404);
+    if (bringToPlayer && (character.role !== "npc" || state.combat)) {
+      throw new BadRequest("Only NPCs can be brought to the player, outside combat.");
+    }
+    const stats = {
+      hp: hp ?? Math.min(character.hp, maxHp), maxHp, skills,
+      ...(name === undefined ? {} : { name }),
+      ...(profile === undefined ? {} : { profile }),
+    };
     const condition = stats.hp > 0 ? null : character.condition ?? ({
       deadly: "dead", standard: "dying", forgiving: "down",
     } as const)[state.world.lethality];
@@ -254,27 +284,28 @@ app.patch("/api/campaigns/:id/characters/:characterId", async (c) => {
         system: "You are the Game Master. Narrate this divine edit in one or two sentences in the player's recent language. Do not change anything else.",
         messages: [{ role: "user", text: JSON.stringify({
           effect: label, character: character.name, before: { hp: character.hp, maxHp: character.maxHp, skills: character.skills },
-          after: { name: stats.name, hp: stats.hp, maxHp, skills }, recent: store.transcript(id).filter((entry) => entry.kind === "player").slice(-1),
+          after: { name: stats.name, hp: stats.hp, maxHp, skills }, recent: (await store.transcript(id)).filter((entry) => entry.kind === "player").slice(-1),
         }) }],
       });
       events.push({ type: "gm_narrated", text: response.text.trim() || `${character.name} is touched by ${label}.` });
       if (response.usage) events.push({ type: "ai_used", usage: response.usage });
       if (response.trace) events.push({ type: "ai_inspected", trace: response.trace });
     }
-    store.append(id, events);
+    await store.append(id, events);
     afterTurn(id);
-    return c.json(view(id));
+    return c.json(await view(id));
   } finally { turnsInProgress.delete(id); }
 });
 
 app.post("/api/campaigns", async (c) => {
   const setup = await body(c, CampaignSetupSchema);
-  return c.json(view(store.createCampaign(campaignFromSetup(worlds.get(setup.worldId), setup))), 201);
+  const id = await store.createCampaign(campaignFromSetup(await worlds.get(setup.worldId), setup));
+  return c.json(await view(id), 201);
 });
 
-app.get("/api/campaigns/:id", (c) => {
+app.get("/api/campaigns/:id", async (c) => {
   try {
-    return c.json(view(c.req.param("id")));
+    return c.json(await view(c.req.param("id")));
   } catch {
     return c.json({ error: "Campaign not found" }, 404);
   }
@@ -286,25 +317,25 @@ app.post("/api/campaigns/:id/travel", async (c) => {
     from: z.string().min(1).max(120), to: z.string().min(1).max(120), clock: z.number().int().nonnegative(),
   }));
   if (turnsInProgress.has(id)) return c.json({ error: "A turn is already in progress." }, 409);
-  let state;
-  try { state = store.state(id); }
-  catch { return c.json({ error: "Campaign not found." }, 404); }
-  if (state.clock !== clock) return c.json({ error: "The Campaign has advanced. Check the routes again." }, 409);
-
+  turnsInProgress.add(id);
   try {
+    let state;
+    try { state = await store.state(id); }
+    catch { return c.json({ error: "Campaign not found." }, 404); }
+    if (state.clock !== clock) return c.json({ error: "The Campaign has advanced. Check the routes again." }, 409);
     const { events, result } = playerTravel(state, from, to);
-    store.append(id, [
+    await store.append(id, [
       { type: "player_said", text: `Travel to ${to}.` },
       ...events,
       { type: "gm_narrated", text: `You leave ${from} and arrive at ${to} after ${result.minutes} min.` },
       { type: "replies_suggested", replies: [] },
     ]);
     afterTurn(id);
-    return c.json(view(id));
+    return c.json(await view(id));
   } catch (error) {
     if (error instanceof TravelRejected) return c.json({ error: error.message }, 409);
     throw error;
-  }
+  } finally { turnsInProgress.delete(id); }
 });
 
 const TurnBody = z.object({
@@ -316,21 +347,21 @@ app.post("/api/campaigns/:id/turns", async (c) => {
   const id = c.req.param("id");
   const parsed = TurnBody.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: "Enter a valid message and select valid NPC targets." }, 400);
+  if (turnsInProgress.has(id)) return c.json({ error: "A turn is already in progress" }, 409);
+  turnsInProgress.add(id);
   try {
-    store.state(id);
+    await store.state(id);
   } catch {
+    turnsInProgress.delete(id);
     return c.json({ error: "Campaign not found" }, 404);
   }
-  if (turnsInProgress.has(id)) return c.json({ error: "A turn is already in progress" }, 409);
-
-  turnsInProgress.add(id);
   return streamSSE(c, async (stream) => {
     try {
       await gm.takeTurn(id, parsed.data.text, {
         targetIds: parsed.data.targetIds,
         onText: (delta) => void stream.writeSSE({ event: "text", data: JSON.stringify(delta) }),
       });
-      await stream.writeSSE({ event: "done", data: JSON.stringify(view(id)) });
+      await stream.writeSSE({ event: "done", data: JSON.stringify(await view(id)) });
       afterTurn(id);
     } catch (err) {
       console.error(err);

@@ -11,12 +11,14 @@
   "dependencies": {
     "@hono/node-server": "^2.1.6",
     "hono": "^4.13.17",
+    "pg": "^8.23.1",
     "sqlite-vec": "^0.1.9",
     "ulid": "^3.0.2",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.1.0"

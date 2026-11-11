@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { ApiError, getCampaign, portraitUrl, takeTurn, type CampaignView, type Character, type TranscriptEntry } from "./api";
+import { ApiError, getCampaign, getSession, portraitUrl, signIn, signOut, takeTurn, type CampaignView, type Character, type Session, type TranscriptEntry } from "./api";
 import { AiLoading } from "./AiLoading";
 import { GodConsole } from "./GodConsole";
 import { CampaignSetup } from "./CampaignSetup";
@@ -31,6 +31,73 @@ function loadInitialCampaign() {
 }
 
 export function App() {
+  const [session, setSession] = useState<Session>();
+  const [statusError, setStatusError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const sessionRequest = useRef<Promise<Session>>(undefined);
+
+  function checkSession() {
+    setStatusError("");
+    sessionRequest.current ??= getSession().finally(() => { sessionRequest.current = undefined; });
+    void sessionRequest.current.then(setSession).catch(() => setStatusError("Couldn’t connect to AI World."));
+  }
+
+  useEffect(() => {
+    const expired = () => setSession({ required: true, email: null });
+    window.addEventListener("ai-world:session-expired", expired);
+    checkSession();
+    return () => window.removeEventListener("ai-world:session-expired", expired);
+  }, []);
+
+  async function submitLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (submitting) return;
+    const fields = new FormData(event.currentTarget);
+    setSubmitting(true);
+    setStatusError("");
+    try { setSession(await signIn(String(fields.get("email")), String(fields.get("password")))); }
+    catch (error) { setStatusError(error instanceof ApiError ? error.message : "Couldn’t sign in. Try again."); }
+    finally { setSubmitting(false); }
+  }
+
+  async function endSession() {
+    if (submitting) return;
+    setSubmitting(true);
+    try { setSession(await signOut()); }
+    catch {
+      setSession(undefined);
+      setStatusError("Couldn’t sign out. Retry the connection.");
+    } finally { setSubmitting(false); }
+  }
+
+  if (session && (!session.required || session.email)) {
+    return <Game onSignOut={session.required ? endSession : undefined} />;
+  }
+
+  return (
+    <main className="login-page">
+      <section className="login-panel" aria-labelledby="login-title">
+        <span className="world-mark" aria-hidden="true">
+          <svg viewBox="0 0 28 28" fill="none"><path d="M14 2 25 14 14 26 3 14 14 2Z"/><path d="M14 6v16M6 14h16m-12-4 8 8m0-8-8 8"/></svg>
+        </span>
+        <h1 id="login-title">AI World</h1>
+        {session ? (
+          <form className="login-form" onSubmit={submitLogin}>
+            <p>Sign in to open your campaign.</p>
+            <label>Email<input type="email" name="email" autoComplete="username" required maxLength={254} /></label>
+            <label>Password<input type="password" name="password" autoComplete="current-password" required maxLength={256} /></label>
+            {statusError && <p className="error" role="alert">{statusError}</p>}
+            <button disabled={submitting}>{submitting ? "Signing in…" : "Sign in"}</button>
+          </form>
+        ) : statusError ? (
+          <><p className="error" role="alert">{statusError}</p><button onClick={checkSession}>Retry connection</button></>
+        ) : <p role="status">Connecting…</p>}
+      </section>
+    </main>
+  );
+}
+
+function Game({ onSignOut }: { onSignOut?: () => void }) {
   const [campaign, setCampaign] = useState<CampaignView | null>(null);
   const [pending, setPending] = useState<{ player: string; narration: string; targets: { id: string; name: string }[] } | null>(null);
   const [loading, setLoading] = useState(true);
@@ -169,6 +236,7 @@ export function App() {
         title={campaign?.state.combat ? "End combat before travelling" : undefined} aria-haspopup="dialog"><NavIcon name="travel" />Travel</button>}
       <button className="nav-item" onClick={() => fromNavigation(() => setConsoleOpen(true))} disabled={blocked} aria-haspopup="dialog"><NavIcon name="console" />God Console</button>
       <button className="nav-item new-campaign" onClick={() => fromNavigation(() => openSetup())} disabled={blocked || !campaign} aria-haspopup="dialog"><NavIcon name="new" />New campaign</button>
+      {onSignOut && <button className="nav-item" onClick={() => fromNavigation(onSignOut)} disabled={blocked}>Sign out</button>}
     </nav>
   );
 

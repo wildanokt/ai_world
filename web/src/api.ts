@@ -106,7 +106,11 @@ export class ApiError extends Error {
 }
 
 async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) throw new ApiError(res.status, (await res.json().catch(() => null))?.error ?? (res.statusText || `HTTP ${res.status}`));
+  if (!res.ok) {
+    const error = (await res.json().catch(() => null))?.error;
+    if (res.status === 401 && error === "Sign in to continue.") window.dispatchEvent(new Event("ai-world:session-expired"));
+    throw new ApiError(res.status, error ?? (res.statusText || `HTTP ${res.status}`));
+  }
   return res.json() as Promise<T>;
 }
 
@@ -116,6 +120,11 @@ const send = (method: string, url: string, body?: unknown) =>
     headers: body === undefined ? undefined : { "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+
+export type Session = { required: boolean; email: string | null };
+export const getSession = () => fetch("/api/auth/session").then(json<Session>);
+export const signIn = (email: string, password: string) => send("POST", "/api/auth/login", { email, password }).then(json<Session>);
+export const signOut = () => send("POST", "/api/auth/logout").then(json<Session>);
 
 export type CampaignSetup = Pick<WorldDoc, "premise" | "tone" | "contentLimits" | "lethality" | "startingLocation" | "characters"> & {
   worldId: string;
@@ -154,13 +163,19 @@ export const getTimeline = (id: string) => fetch(campaignPath(id) + "/timeline")
 export const addSnapshot = (id: string, name: string) => send("POST", campaignPath(id) + "/snapshots", { name }).then(json);
 export const rewind = (id: string, snapshotId: string) => send("POST", campaignPath(id) + "/rewind", { snapshotId }).then(json<CampaignView>);
 export const getInspector = (id: string) => fetch(campaignPath(id) + "/inspector").then(json<unknown[]>);
+type WaitingForCodex = { state: "preparing" | "other-session" | "canceling" | "finishing" };
 export interface CodexAuthStatus {
   credentials: "present" | "missing" | "unknown";
   login: "pending" | "succeeded" | "failed" | null;
+  hosted?: true;
+  device?: WaitingForCodex | { state: "ready"; url: string; code: string };
+  browser?: WaitingForCodex | { state: "ready"; url: string };
 }
 const codexAuthPath = "/api/ai/codex-auth";
 export const getCodexAuth = (signal: AbortSignal) => fetch(codexAuthPath, { signal }).then(json<CodexAuthStatus>);
-export const startCodexLogin = () => send("POST", codexAuthPath, {}).then(json<{ login: "pending" }>);
+export const startCodexLogin = (method: "browser" | "device") => send("POST", codexAuthPath, { method }).then(json<{ login: "pending" }>);
+export const cancelCodexLogin = () => send("DELETE", codexAuthPath).then(json<{ login: "pending" }>);
+export const finishCodexLogin = (address: string) => send("POST", codexAuthPath + "/callback", { address }).then(json<{ login: "pending" }>);
 
 export const getAiSettings = () => fetch("/api/ai/settings").then(json<AiSettings>);
 export const saveAiSettings = (settings: AiSettings) => send("PUT", "/api/ai/settings", settings).then(json<AiSettings>);

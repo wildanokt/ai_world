@@ -151,6 +151,35 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: v
 .hint, .muted { color: var(--muted); }
 .error { color: var(--fail); margin: 4px 0; }
 
+.login-page {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 24px 16px;
+}
+.login-panel {
+  width: min(100%, 390px);
+  padding: clamp(20px, 5vw, 32px);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+.login-panel h1 { margin-top: 12px; font-size: 34px; line-height: 1.1; }
+.login-panel p:not(.error) { color: var(--muted); }
+.login-form { display: grid; gap: 14px; }
+.login-form p { margin: 0; }
+.login-form label { display: grid; gap: 5px; font-weight: 600; }
+.login-form input {
+  min-width: 0;
+  padding: 9px 11px;
+  font: inherit;
+  color: var(--ink);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.login-form button { min-height: 44px; }
+
 .composer-area { border-top: 1px solid var(--line); background: var(--bg); padding: 10px clamp(12px, 3vw, 22px); }
 .composer-row { display: flex; gap: 8px; margin-top: 4px; align-items: stretch; }
 .composer-row button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-width: 74px; }
@@ -375,6 +404,16 @@ summary { cursor: pointer; font-weight: 600; }
 .campaign-controls summary { min-height: 38px; align-content: center; }
 .campaign-controls details[open] > summary { margin-bottom: 0.5rem; }
 .campaign-controls button, .gc-form fieldset button { min-height: 2rem; }
+.codex-sign-in-link { align-self: flex-start; color: var(--accent); text-underline-offset: .2em; }
+.codex-device-code {
+  padding: .4rem .65rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 1.1rem;
+  user-select: all;
+}
 .location-row select { max-width: 10rem; }
 .ai-trace { max-height: 18rem; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .confirm-dialog, .sheet-dialog {

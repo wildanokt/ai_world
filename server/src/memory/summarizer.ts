@@ -2,12 +2,12 @@
  * Rolling summaries: older turns are condensed into scene summaries, and scenes into chapters,
  * so every Game Master turn stays small. Nothing is deleted; Recall still searches the full log.
  */
-import type { CampaignStore } from "../campaign/store.js";
+import type { RuntimeCampaignStore } from "../postgres.js";
 import { transcriptText } from "../game-master/context.js";
 import type { ModelProvider } from "../model/provider.js";
 
 export interface SummarizerOptions {
-  store: CampaignStore;
+  store: RuntimeCampaignStore;
   model: ModelProvider;
   /** Summarize once this many transcript entries are unsummarized. */
   sceneEvery?: number;
@@ -40,8 +40,8 @@ export function createSummarizer({ store, model, sceneEvery = 30, keepRecent = 1
   }
 
   async function step(campaignId: string) {
-    const { summaries } = store.state(campaignId);
-    const transcript = store.transcript(campaignId);
+    const { summaries } = await store.state(campaignId);
+    const transcript = await store.transcript(campaignId);
 
     const covered = summaries.scenes.at(-1)?.to ?? 0;
     if (transcript.length - covered >= sceneEvery) {
@@ -50,17 +50,17 @@ export function createSummarizer({ store, model, sceneEvery = 30, keepRecent = 1
       while (to > covered && transcript[to]?.kind !== "player") to--;
       if (to <= covered) return;
       const { text, usage } = await summarize(`<story_part>\n${transcriptText(transcript.slice(covered, to))}\n</story_part>`);
-      if (text) store.append(campaignId, [{ type: "scene_summarized", from: covered, to, text }]);
-      if (usage) store.append(campaignId, [{ type: "ai_used", usage }]);
+      if (text) await store.append(campaignId, [{ type: "scene_summarized", from: covered, to, text }]);
+      if (usage) await store.append(campaignId, [{ type: "ai_used", usage }]);
     }
 
-    const { scenes, chapters } = store.state(campaignId).summaries;
+    const { scenes, chapters } = (await store.state(campaignId)).summaries;
     const chaptered = chapters.at(-1)?.toScene ?? 0;
     if (scenes.length - chaptered >= chapterEvery) {
       const part = scenes.slice(chaptered).map((s) => s.text).join("\n\n");
       const { text, usage } = await summarize(`<scene_summaries>\n${part}\n</scene_summaries>\nCombine these into one chapter summary.`);
-      if (text) store.append(campaignId, [{ type: "chapter_summarized", fromScene: chaptered, toScene: scenes.length, text }]);
-      if (usage) store.append(campaignId, [{ type: "ai_used", usage }]);
+      if (text) await store.append(campaignId, [{ type: "chapter_summarized", fromScene: chaptered, toScene: scenes.length, text }]);
+      if (usage) await store.append(campaignId, [{ type: "ai_used", usage }]);
     }
   }
 

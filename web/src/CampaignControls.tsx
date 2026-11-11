@@ -1,8 +1,8 @@
 import { AiLoading } from "./AiLoading";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import {
   addSnapshot, editLive, generatePortrait, getAiSettings, getCampaign, getCodexAuth, getInspector, getTimeline,
-  portraitUrl, rewind, saveAiSettings, startCodexLogin, uploadPortrait,
+  cancelCodexLogin, finishCodexLogin, portraitUrl, rewind, saveAiSettings, startCodexLogin, uploadPortrait,
   type AiSettings, type CampaignView, type Character, type CodexAuthStatus, type Effort, type Timeline,
 } from "./api";
 
@@ -162,8 +162,14 @@ function CodexLogin() {
   const [refresh, setRefresh] = useState(0);
   const [checking, setChecking] = useState(true);
   const [starting, setStarting] = useState(false);
+  const [canceling, setCanceling] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [copiedCode, setCopiedCode] = useState("");
   const pending = status?.login === "pending";
+  const device = status?.device;
+  const browser = status?.browser;
+  const challenge = browser ?? device;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -193,12 +199,11 @@ function CodexLogin() {
     setRefresh((value) => value + 1);
   }
 
-  async function signIn() {
+  async function signIn(method: "browser" | "device") {
     setStarting(true);
     setError("");
     try {
-      await startCodexLogin();
-      setStatus({ credentials: "unknown", login: "pending" });
+      await startCodexLogin(method);
       checkAgain();
     } catch (error) {
       setError((error as Error).message);
@@ -208,26 +213,100 @@ function CodexLogin() {
     }
   }
 
-  const message = pending
-    ? "Finish signing in in your default browser. This status updates automatically."
-    : checking
-      ? "Checking Codex login…"
-      : status?.credentials === "present"
-        ? "Codex credentials are available on this PC."
-        : status?.credentials === "missing"
-          ? "Codex is signed out."
-          : "Couldn’t check Codex login. Confirm the CLI is installed.";
+  async function submitBrowserResult(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (submitting) return;
+    const form = event.currentTarget;
+    const address = String(new FormData(form).get("address") ?? "");
+    setSubmitting(true);
+    setError("");
+    try {
+      await finishCodexLogin(address);
+      form.reset();
+      checkAgain();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function cancel() {
+    setCanceling(true);
+    setError("");
+    try {
+      await cancelCodexLogin();
+      checkAgain();
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setCanceling(false);
+    }
+  }
+
+  async function copyCode(code: string) {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopiedCode(code);
+    } catch {
+      setError("Select the code and copy it manually.");
+    }
+  }
+
+  const pendingMessages = {
+    preparing: browser ? "Preparing browser sign-in…" : "Getting a one-time code…",
+    "other-session": "Codex sign-in is open in another browser session.",
+    canceling: "Canceling sign-in…",
+    finishing: "Finishing sign-in…",
+    ready: "Waiting for you to sign in.",
+  };
+  const message = pending && challenge ? pendingMessages[challenge.state]
+    : pending ? "Finish signing in in your default browser."
+    : checking ? "Checking Codex login…"
+    : status?.credentials === "present" ? "Codex is signed in."
+    : status?.credentials === "missing" ? "Codex is signed out."
+    : "Couldn’t check Codex login. Confirm the CLI is installed.";
   return <fieldset className="gc-form">
     <legend>Codex login</legend>
     <p role="status">{message}</p>
     {status?.login === "failed" && !checking && (
-      <p className="error" role="alert">The browser sign-in did not complete. Try again or run <code>codex login</code> in PowerShell.</p>
+      <p className="error" role="alert">Sign-in expired or did not complete. Try again.</p>
     )}
+    {browser?.state === "ready" && <>
+      <a className="codex-sign-in-link" href={browser.url} target="_blank" rel="noopener noreferrer">Open ChatGPT sign-in</a>
+      <p>Sign in on this device. When the last tab opens a <code>127.0.0.1</code> address, copy its full address, even if the page can’t load.</p>
+      <form className="gc-form" onSubmit={submitBrowserResult}>
+        <label className="field">
+          <span className="field-label">Address from the last tab</span>
+          <input type="password" name="address" autoComplete="off" autoCapitalize="off" spellCheck={false} maxLength={8000} required />
+        </label>
+        <div className="quick-replies">
+          <button type="submit" disabled={submitting || canceling}>{submitting ? "Finishing…" : "Finish sign-in"}</button>
+        </div>
+      </form>
+    </>}
+    {device?.state === "ready" && <>
+      <a className="codex-sign-in-link" href={device.url} target="_blank" rel="noopener noreferrer">Open ChatGPT sign-in</a>
+      <p>Choose your ChatGPT account and enter this one-time code within 15 minutes.</p>
+      <div className="quick-replies">
+        <code className="codex-device-code">{device.code}</code>
+        <button type="button" className="ghost" onClick={() => void copyCode(device.code)}>
+          {copiedCode === device.code ? "Copied" : "Copy code"}
+        </button>
+      </div>
+      <p className="muted">If prompted, enable device code sign-in in your ChatGPT security settings.</p>
+    </>}
     {error && <p className="error" role="alert">{error}</p>}
     <div className="quick-replies">
-      <button type="button" disabled={starting || pending} onClick={signIn}>
-        {starting ? "Opening…" : status?.credentials === "present" ? "Sign in again" : "Sign in with ChatGPT"}
-      </button>
+      {!pending && <>
+        <button type="button" disabled={starting || checking} onClick={() => void signIn("browser")}>
+          {starting ? "Starting…" : status?.credentials === "present" ? "Sign in again" : "Sign in with ChatGPT"}
+        </button>
+        {status?.hosted && <button type="button" className="ghost" disabled={starting || checking}
+          onClick={() => void signIn("device")}>Use device code</button>}
+      </>}
+      {(challenge?.state === "ready" || challenge?.state === "preparing") &&
+        <button type="button" className="ghost" disabled={canceling || submitting} onClick={cancel}>Cancel sign-in</button>}
       <button type="button" className="ghost" disabled={checking || starting} onClick={checkAgain}>Check status</button>
     </div>
   </fieldset>;
